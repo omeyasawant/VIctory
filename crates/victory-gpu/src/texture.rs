@@ -44,6 +44,10 @@ pub(crate) struct Staging {
     /// Mips per array slice.
     mips: u32,
     memory: *const u8,
+    /// Original packed 16-bit format (86 or 115) when the host texture was
+    /// widened to R8G8B8A8_UNORM, so detiled 2-byte texels expand into the
+    /// 4-byte staging buffer.
+    widened_from: Option<u32>,
     last: Mutex<Last>,
 }
 
@@ -236,24 +240,75 @@ impl Staging {
                 "a sampled texture's memory is all zero (not streamed yet, or a failed BCPack read)"
             );
         }
+        let mut packed = Vec::new();
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
-            let len = pitch * rows as usize * f.Depth as usize;
+            let lines = rows as usize * f.Depth as usize;
+            let len = if self.widened_from.is_some() && lines > 0 {
+                // The last subresource allocation stops at the last row's used bytes.
+                pitch * (lines - 1) + f.Width as usize * 4
+            } else {
+                pitch * lines
+            };
             // SAFETY: the subresource's part of the mapped staging buffer.
             let linear = unsafe {
                 std::slice::from_raw_parts_mut(self.data.add(footprint.Offset as usize), len)
             };
-            if let Err(e) =
-                self.layout
-                    .detile(tiled, mip, slice, linear, pitch, pitch * rows as usize)
-            {
+            if let Err(e) = detile_subresource(
+                &self.layout,
+                tiled,
+                mip,
+                slice,
+                linear,
+                pitch,
+                rows as usize,
+                f.Depth as usize,
+                self.widened_from,
+                &mut packed,
+            ) {
                 tracing::warn!(?e, mip, slice, "texture not detiled");
                 return;
             }
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn detile_subresource(
+    layout: &victory_formats::texture::Layout,
+    tiled: &[u8],
+    mip: u32,
+    slice: u32,
+    linear: &mut [u8],
+    row_pitch: usize,
+    rows: usize,
+    depth: usize,
+    widened_from: Option<u32>,
+    packed: &mut Vec<u8>,
+) -> Result<(), victory_formats::texture::Error> {
+    let Some(packed_format) = widened_from else {
+        return layout.detile(tiled, mip, slice, linear, row_pitch, row_pitch * rows);
+    };
+    let width = layout
+        .mips
+        .get(mip as usize)
+        .map_or(0, |m| m.width as usize);
+    let packed_pitch = width * 2;
+    let packed_plane = packed_pitch * rows;
+    packed.resize(packed_plane * depth, 0);
+    layout.detile(tiled, mip, slice, packed, packed_pitch, packed_plane)?;
+    crate::resource::expand_packed16_rows(
+        packed_format,
+        width,
+        rows * depth,
+        packed,
+        packed_pitch,
+        linear,
+        row_pitch,
+    );
+    Ok(())
 }
 
 /// Whether `[at, at + len)` is committed memory (streamed textures may be
@@ -298,6 +353,10 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
     let host = host()?;
     // SAFETY: a live resource.
     let d = unsafe { texture.GetDesc() };
+    let title_format = crate::resource::pc_format(desc.format);
+    let widened_from = (d.Format.0 as u32 == crate::resource::RGBA8_UNORM
+        && crate::resource::PACKED_16.contains(&title_format))
+    .then_some(title_format);
     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
         u32::from(d.MipLevels)
     } else {
@@ -337,8 +396,89 @@ fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
         layout,
         mips: u32::from(d.MipLevels),
         memory,
+        widened_from,
         last: Mutex::default(),
     });
     map.insert(resource as usize, s.clone());
     Some(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use victory_formats::texture::{Dimension, Swizzle, Texture, TextureDesc};
+
+    #[test]
+    fn detile_widened_packed16_expands_into_rgba8_staging() {
+        for format in crate::resource::PACKED_16 {
+            let desc = TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 17,
+                height: 9,
+                depth_or_array: 1,
+                mips: 2,
+                format,
+                samples: 1,
+                swizzle: Swizzle::SW_4KB_S,
+            };
+            let tex = Texture::new(&desc).unwrap();
+            let layout = &tex.planes[0].layout;
+            let mut tiled = vec![0u8; layout.size as usize];
+            let mut expected_mips = Vec::new();
+
+            for mip in 0..2u32 {
+                let m = layout.mips[mip as usize];
+                let row_bytes = m.width as usize * 2;
+                let mut src_mip = vec![0u8; row_bytes * m.height as usize];
+                for y in 0..m.height as usize {
+                    for x in 0..m.width as usize {
+                        let px = ((mip as u16 + 1) * 0x1111)
+                            .wrapping_add((y as u16) * 0x0103 + x as u16);
+                        let at = y * row_bytes + x * 2;
+                        src_mip[at..at + 2].copy_from_slice(&px.to_le_bytes());
+                    }
+                }
+                layout
+                    .tile(&mut tiled, mip, 0, &src_mip, row_bytes, src_mip.len())
+                    .unwrap();
+                expected_mips.push(src_mip);
+            }
+
+            let mut packed = Vec::new();
+            for (mip, src_mip) in expected_mips.iter().enumerate() {
+                let m = layout.mips[mip];
+                let width = m.width as usize;
+                let rows = m.height as usize;
+                let row_pitch = (width * 4).next_multiple_of(256);
+                let exact_len = row_pitch * (rows - 1) + width * 4;
+                let mut staging = vec![0x5au8; exact_len];
+                detile_subresource(
+                    layout,
+                    &tiled,
+                    mip as u32,
+                    0,
+                    &mut staging,
+                    row_pitch,
+                    rows,
+                    1,
+                    Some(format),
+                    &mut packed,
+                )
+                .unwrap();
+                for y in 0..rows {
+                    let mut expected = vec![0u8; width * 4];
+                    crate::resource::expand_packed16(
+                        format,
+                        &src_mip[y * width * 2..][..width * 2],
+                        &mut expected,
+                    );
+                    assert_eq!(
+                        &staging[y * row_pitch..][..width * 4],
+                        &expected[..],
+                        "format {format} mip {mip} row {y}"
+                    );
+                }
+            }
+        }
+    }
 }

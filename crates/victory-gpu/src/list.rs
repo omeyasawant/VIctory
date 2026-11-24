@@ -446,6 +446,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
         ) {
+            if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
+                return;
+            }
             if crate::texture::title_written(from) {
                 crate::texture::upload(list, src, from);
             }
@@ -479,6 +482,84 @@ pub(crate) struct CopyLocation {
     resource: This,
     kind: u32,
     footprint: crate::resource::PlacedFootprint,
+}
+
+/// Stages a buffer-to-texture `CopyTextureRegion` source into an upload buffer
+/// filled at submission. When the destination was widened from a packed 16-bit
+/// format to `R8G8B8A8_UNORM` on this GPU, the upload footprint is widened and
+/// the texels are expanded on the CPU at submission.
+#[cfg(windows)]
+fn prepare_footprint_upload(
+    list: &crate::host::HostList,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    src: CopyLocation,
+) -> Option<(
+    windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    CopyLocation,
+    u64,
+)> {
+    use windows::core::Interface;
+    let host = crate::host::host()?;
+    let bytes = src.footprint.bytes()?;
+    let data = buffer_range(src.resource, src.footprint.offset, bytes)?;
+    // SAFETY: a live host resource.
+    let dst_fmt = unsafe { to.GetDesc() }.Format.0 as u32;
+    let src_fmt = crate::resource::pc_format(src.footprint.format);
+    let mut from = src;
+    if dst_fmt == crate::resource::RGBA8_UNORM && crate::resource::PACKED_16.contains(&src_fmt) {
+        if src.footprint.width == 0 || src.footprint.height == 0 || src.footprint.depth == 0 {
+            return None;
+        }
+        if u64::from(src.footprint.row_pitch) < u64::from(src.footprint.width) * 2 {
+            tracing::warn!(
+                footprint = ?src.footprint,
+                "packed 16-bit copy footprint row pitch is smaller than a row"
+            );
+            return None;
+        }
+        let row_pitch = u64::from(src.footprint.width)
+            .checked_mul(4)?
+            .next_multiple_of(256);
+        let widened = crate::resource::PlacedFootprint {
+            offset: 0,
+            format: crate::resource::RGBA8_UNORM,
+            row_pitch: u32::try_from(row_pitch).ok()?,
+            ..src.footprint
+        };
+        let dst_bytes = widened.bytes()?;
+        let lines =
+            usize::try_from(u64::from(src.footprint.height) * u64::from(src.footprint.depth))
+                .ok()?;
+        let (src_len, dst_len) = (
+            usize::try_from(bytes).ok()?,
+            usize::try_from(dst_bytes).ok()?,
+        );
+        let (buffer, staging) = list.upload(host, dst_bytes)?;
+        let (width, src_pitch, dst_pitch) = (
+            src.footprint.width as usize,
+            src.footprint.row_pitch as usize,
+            widened.row_pitch as usize,
+        );
+        let (src_at, dst_at) = (data as usize, staging as usize);
+        list.defer_host(move || {
+            let mut packed = vec![0u8; src_len];
+            crate::host::copy_mapped(packed.as_mut_ptr(), src_at as *const u8, src_len, false);
+            // SAFETY: `staging` is the persistent mapping of `buffer`, kept
+            // alive in the list's `uploads` until the list is reset.
+            let dst = unsafe { std::slice::from_raw_parts_mut(dst_at as *mut u8, dst_len) };
+            crate::resource::expand_packed16_rows(
+                src_fmt, width, lines, &packed, src_pitch, dst, dst_pitch,
+            );
+        });
+        from.resource = buffer.as_raw().cast_const().cast();
+        from.footprint = widened;
+        return Some((buffer, from, dst_bytes));
+    }
+    let (buffer, staging) = list.upload(host, bytes)?;
+    list.defer_copy(staging, data, bytes as usize);
+    from.resource = buffer.as_raw().cast_const().cast();
+    from.footprint.offset = 0;
+    Some((buffer, from, bytes))
 }
 
 /// Texture to texture on the GPU; buffer to texture through an upload
@@ -516,30 +597,25 @@ extern "system" fn copy_texture_region(
         #[cfg(feature = "diagnostics")]
         let mut read = None;
         if src.kind == FOOTPRINT {
-            let (Some(host), Some(bytes)) = (crate::host::host(), src.footprint.bytes()) else {
+            let Some((buffer, staged, bytes)) = prepare_footprint_upload(list, to, src) else {
                 return;
             };
-            let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
-                return;
-            };
-            let Some((buffer, staging)) = list.upload(host, bytes) else {
-                return;
-            };
-            // The list owns this mapped D3D12 upload buffer. Wine can report
-            // its address as MEM_FREE, so use the host-upload path.
-            list.defer_fill(staging, data, bytes as usize);
-            from.resource = buffer.as_raw().cast_const().cast();
-            from.footprint.offset = 0;
+            from = staged;
             #[cfg(feature = "diagnostics")]
             {
                 // SAFETY: a live buffer.
                 read = Some((unsafe { buffer.GetGPUVirtualAddress() }, bytes));
             }
+            #[cfg(not(feature = "diagnostics"))]
+            let _ = bytes;
             _upload = buffer;
         } else {
             let Some(texture) = crate::resource::host_resource(src.resource) else {
                 return;
             };
+            if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
+                return;
+            }
             if crate::texture::title_written(texture) {
                 crate::texture::upload(list, src.resource, texture);
             }
@@ -621,6 +697,9 @@ extern "system" fn resolve(
             crate::resource::host_resource(src),
         )
     {
+        if crate::resource::skip_mixed_packed_copy("ResolveSubresource", to, from) {
+            return;
+        }
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D12::{
             D3D12_RESOLVE_MODE_AVERAGE, ID3D12GraphicsCommandList1,
@@ -632,6 +711,7 @@ extern "system" fn resolve(
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
+        let format = crate::resource::target_format(format);
         #[cfg(feature = "diagnostics")]
         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
         // SAFETY: an open list and live textures; the region is inside both.

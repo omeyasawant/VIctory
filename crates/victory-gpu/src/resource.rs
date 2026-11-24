@@ -91,7 +91,7 @@ pub(crate) struct ResourceDesc {
     height: u32,
     depth_or_array_size: u16,
     mip_levels: u16,
-    format: u32,
+    pub(crate) format: u32,
     sample_count: u32,
     sample_quality: u32,
     layout: u32,
@@ -239,11 +239,11 @@ pub(crate) fn pc_format(format: u32) -> u32 {
 
 /// R8G8B8A8_UNORM, which stands in for a packed 16-bit render target the
 /// host cannot make (see [`target_format`]).
-const RGBA8_UNORM: u32 = 28;
+pub(crate) const RGBA8_UNORM: u32 = 28;
 
 /// The console's packed 16-bit colour formats a title renders to:
 /// B5G5R5A1_UNORM (86) and B4G4R4A4_UNORM (115).
-const PACKED_16: [u32; 2] = [86, 115];
+pub(crate) const PACKED_16: [u32; 2] = [86, 115];
 
 /// Whether the host GPU lacks render-target or typed unordered-access
 /// support for `format` (asked once per format). NVIDIA has neither for
@@ -300,6 +300,195 @@ pub(crate) fn target_format(format: u32) -> u32 {
     }
 }
 
+/// Expands one packed 16-bit texel in DXGI `B5G5R5A1_UNORM` (86: B bits 0-4,
+/// G 5-9, R 10-14, A 15) or `B4G4R4A4_UNORM` (115: B 0-3, G 4-7, R 8-11, A
+/// 12-15) into `R8G8B8A8_UNORM` by bit replication.
+fn unpack_16(format: u32, packed: u16) -> [u8; 4] {
+    let bits = |shift: u32, width: u32| -> u8 { ((packed >> shift) & ((1 << width) - 1)) as u8 };
+    match format {
+        86 => {
+            let (r, g, b) = (bits(10, 5), bits(5, 5), bits(0, 5));
+            let a = if packed >> 15 != 0 { 255 } else { 0 };
+            [
+                (r << 3) | (r >> 2),
+                (g << 3) | (g >> 2),
+                (b << 3) | (b >> 2),
+                a,
+            ]
+        }
+        115 => {
+            let (r, g, b, a) = (bits(8, 4), bits(4, 4), bits(0, 4), bits(12, 4));
+            [(r << 4) | r, (g << 4) | g, (b << 4) | b, (a << 4) | a]
+        }
+        _ => unreachable!("only B5G5R5A1 and B4G4R4A4 are packed 16-bit"),
+    }
+}
+
+fn quantize_unorm(v: u8, max: u16) -> u16 {
+    (u16::from(v) * max + 127) / 255
+}
+
+/// Packs one `R8G8B8A8_UNORM` texel into DXGI `B5G5R5A1_UNORM` (86) or
+/// `B4G4R4A4_UNORM` (115).
+#[allow(dead_code)] // readback counterpart for texture-to-buffer copies (PR #67)
+fn pack_16(format: u32, rgba: [u8; 4]) -> u16 {
+    let [r, g, b, a] = rgba;
+    match format {
+        86 => {
+            quantize_unorm(b, 31)
+                | (quantize_unorm(g, 31) << 5)
+                | (quantize_unorm(r, 31) << 10)
+                | (quantize_unorm(a, 1) << 15)
+        }
+        115 => {
+            quantize_unorm(b, 15)
+                | (quantize_unorm(g, 15) << 4)
+                | (quantize_unorm(r, 15) << 8)
+                | (quantize_unorm(a, 15) << 12)
+        }
+        _ => unreachable!("only B5G5R5A1 and B4G4R4A4 are packed 16-bit"),
+    }
+}
+
+/// Expands `src` (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per
+/// texel) into `dst` (`R8G8B8A8_UNORM`, 4 bytes per texel).
+pub(crate) fn expand_packed16(format: u32, src: &[u8], dst: &mut [u8]) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for (s, d) in src
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+    {
+        *d = unpack_16(format, u16::from_le_bytes(*s));
+    }
+}
+
+/// Packs `src` (`R8G8B8A8_UNORM`, 4 bytes per texel) into `dst`
+/// (`B5G5R5A1_UNORM` 86 or `B4G4R4A4_UNORM` 115, 2 bytes per texel).
+#[allow(dead_code)] // readback counterpart for texture-to-buffer copies (PR #67)
+pub(crate) fn pack_rgba8_to_16(format: u32, src: &[u8], dst: &mut [u8]) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for (s, d) in src
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(dst.as_chunks_mut::<2>().0.iter_mut())
+    {
+        *d = pack_16(format, *s).to_le_bytes();
+    }
+}
+
+fn for_rows(
+    width: usize,
+    lines: usize,
+    src: (&[u8], usize, usize),
+    dst: (&mut [u8], usize, usize),
+    mut row: impl FnMut(&[u8], &mut [u8]),
+) {
+    if width == 0 || lines == 0 {
+        return;
+    }
+    for line in 0..lines {
+        let s = &src.0[line * src.1..][..width * src.2];
+        let d = &mut dst.0[line * dst.1..][..width * dst.2];
+        row(s, d);
+    }
+}
+
+/// Expands `lines` rows of `width` texels in packed 16-bit `format`
+/// (`src_pitch` bytes apart) into `R8G8B8A8_UNORM` (`dst_pitch` bytes apart).
+pub(crate) fn expand_packed16_rows(
+    format: u32,
+    width: usize,
+    lines: usize,
+    src: &[u8],
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for_rows(
+        width,
+        lines,
+        (src, src_pitch, 2),
+        (dst, dst_pitch, 4),
+        |s, d| {
+            expand_packed16(format, s, d);
+        },
+    );
+}
+
+/// Packs `lines` rows of `width` `R8G8B8A8_UNORM` texels (`src_pitch` bytes
+/// apart) into packed 16-bit `format` (`dst_pitch` bytes apart).
+#[allow(dead_code)] // readback counterpart for texture-to-buffer copies (PR #67)
+pub(crate) fn pack_rgba8_to_16_rows(
+    format: u32,
+    width: usize,
+    lines: usize,
+    src: &[u8],
+    src_pitch: usize,
+    dst: &mut [u8],
+    dst_pitch: usize,
+) {
+    if !PACKED_16.contains(&format) {
+        return;
+    }
+    for_rows(
+        width,
+        lines,
+        (src, src_pitch, 4),
+        (dst, dst_pitch, 2),
+        |s, d| {
+            pack_rgba8_to_16(format, s, d);
+        },
+    );
+}
+
+/// Whether a GPU-to-GPU copy or resolve between `to` and `from` mixes a
+/// native packed 16-bit texture with a widened (or different) format, logging
+/// once per packed format so callers can skip the command before recording
+/// barriers or marking the destination written.
+#[cfg(windows)]
+pub(crate) fn skip_mixed_packed_copy(
+    op: &str,
+    to: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    from: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+) -> bool {
+    use std::sync::Once;
+    // SAFETY: live host resources.
+    let (to_fmt, from_fmt) =
+        unsafe { (to.GetDesc().Format.0 as u32, from.GetDesc().Format.0 as u32) };
+    if to_fmt == from_fmt {
+        return false;
+    }
+    let Some(packed) = [from_fmt, to_fmt]
+        .into_iter()
+        .find(|f| PACKED_16.contains(f))
+    else {
+        return false;
+    };
+    static ONCE: [Once; 2] = [Once::new(), Once::new()];
+    if let Some(i) = PACKED_16.iter().position(|&f| f == packed) {
+        ONCE[i].call_once(|| {
+            tracing::warn!(
+                op,
+                packed_format = packed,
+                to_format = to_fmt,
+                from_format = from_fmt,
+                "skipping GPU copy between packed 16-bit texture and widened R8G8B8A8_UNORM target"
+            );
+        });
+    }
+    true
+}
+
 /// The typeless format of a format's family (itself if it has none).
 pub(crate) fn family(format: u32) -> u32 {
     const FAMILIES: [(u32, u32); 22] = [
@@ -347,7 +536,9 @@ pub(crate) fn view_format(this: This) -> Option<u32> {
     let host = host_resource(this)?;
     // SAFETY: a live resource.
     let format = unsafe { host.GetDesc() }.Format.0 as u32;
-    (format != own).then_some(own)
+    // Widened packed targets are typed R8G8B8A8_UNORM, so null view descs
+    // can stay null and inherit the resource's exact dimension.
+    (format != own && format != target_format(own)).then_some(own)
 }
 
 /// Depth formats with their typeless family: depth textures that shaders
@@ -379,11 +570,11 @@ fn mip_count(desc: &ResourceDesc) -> u32 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlacedFootprint {
     pub(crate) offset: u64,
-    format: u32,
-    width: u32,
-    height: u32,
-    depth: u32,
-    row_pitch: u32,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) depth: u32,
+    pub(crate) row_pitch: u32,
 }
 
 impl PlacedFootprint {
@@ -2174,6 +2365,380 @@ mod tests {
                     Err(e) => format!("{e}"),
                 }
             );
+        }
+    }
+
+    #[test]
+    fn packed_16_conversion_matches_dxgi_layout() {
+        // B5G5R5A1_UNORM (86): B in bits 0-4, G 5-9, R 10-14, A 15.
+        let mut out = [0u8; 4];
+        for (packed, expected) in [
+            (0x0000u16, [0, 0, 0, 0]),
+            (0xffff, [255, 255, 255, 255]),
+            (0x8000, [0, 0, 0, 255]),
+            (0x7c00, [255, 0, 0, 0]),
+            (0x03e0, [0, 255, 0, 0]),
+            (0x001f, [0, 0, 255, 0]),
+            // Bit replication: v << 3 | v >> 2 (r=24->198, g=10->82, b=21->173).
+            (0x8000 | (24 << 10) | (10 << 5) | 21, [198, 82, 173, 255]),
+            ((1 << 10) | (16 << 5) | 2, [8, 132, 16, 0]),
+        ] {
+            expand_packed16(86, &packed.to_le_bytes(), &mut out);
+            assert_eq!(out, expected, "B5G5R5A1 {packed:#06x}");
+        }
+
+        // B4G4R4A4_UNORM (115): B in bits 0-3, G 4-7, R 8-11, A 12-15.
+        for (packed, expected) in [
+            (0x0000u16, [0, 0, 0, 0]),
+            (0xffff, [255, 255, 255, 255]),
+            (0xf000, [0, 0, 0, 255]),
+            (0x0f00, [255, 0, 0, 0]),
+            (0x00f0, [0, 255, 0, 0]),
+            (0x000f, [0, 0, 255, 0]),
+            (0xca73, [0xaa, 0x77, 0x33, 0xcc]),
+        ] {
+            expand_packed16(115, &packed.to_le_bytes(), &mut out);
+            assert_eq!(out, expected, "B4G4R4A4 {packed:#06x}");
+        }
+
+        // Every 16-bit value round-trips losslessly through RGBA8 and back.
+        for format in PACKED_16 {
+            let mut rgba = [0u8; 4];
+            let mut back = [0u8; 2];
+            for value in 0..=u16::MAX {
+                let raw = value.to_le_bytes();
+                expand_packed16(format, &raw, &mut rgba);
+                pack_rgba8_to_16(format, &rgba, &mut back);
+                assert_eq!(back, raw, "format {format} value {value:#06x}");
+            }
+        }
+
+        // Alpha thresholding on B5G5R5A1 and pitched multi-row expansion/packing.
+        let mut back = [0u8; 4];
+        pack_rgba8_to_16(86, &[0, 0, 0, 127, 0, 0, 0, 128], &mut back);
+        assert_eq!(
+            [
+                u16::from_le_bytes([back[0], back[1]]),
+                u16::from_le_bytes([back[2], back[3]]),
+            ],
+            [0x0000, 0x8000]
+        );
+
+        let src_rows = [
+            0x1fu8, 0x00, 0xe0, 0x03, 0xaa, 0xaa, // row 0: 2 texels + 2B pitch pad
+            0x00, 0x7c, 0x00, 0x80, // row 1: 2 texels (exact end, no pad)
+        ];
+        let mut dst_rows = [0u8; 16 + 8]; // pitch 16 on row 0, 8 bytes on row 1
+        expand_packed16_rows(86, 2, 2, &src_rows, 6, &mut dst_rows, 16);
+        assert_eq!(&dst_rows[0..8], &[0, 0, 255, 0, 0, 255, 0, 0]);
+        assert_eq!(&dst_rows[16..24], &[255, 0, 0, 0, 0, 0, 0, 255]);
+
+        let mut repacked = [0u8; 10];
+        pack_rgba8_to_16_rows(86, 2, 2, &dst_rows, 16, &mut repacked, 6);
+        assert_eq!(&repacked[0..4], &src_rows[0..4]);
+        assert_eq!(&repacked[6..10], &src_rows[6..10]);
+    }
+
+    #[test]
+    fn target_format_is_identity_for_non_packed_formats() {
+        for format in 0..=200u32 {
+            if PACKED_16.contains(&format) {
+                assert!(
+                    [format, RGBA8_UNORM].contains(&target_format(format)),
+                    "unexpected target format for {format}"
+                );
+            } else if (118..=120).contains(&format) {
+                assert_eq!(target_format(format), format - 118 + 45);
+            } else {
+                assert_eq!(target_format(format), format, "format {format}");
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn packed_16_targets_copy_and_skip_mixed_transfers() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        let null = std::ptr::null();
+        let iid = &RESOURCE_IIDS[0];
+        const COPY_DEST: u32 = 0x400;
+        let make_tex = |format, flags, samples| {
+            let mut out = null;
+            let desc = ResourceDesc {
+                flags,
+                sample_count: samples,
+                ..texture(4, 4, format, 1)
+            };
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &desc,
+                    COPY_DEST,
+                    null.cast(),
+                    iid,
+                    &mut out
+                ),
+                S_OK
+            );
+            out
+        };
+
+        let queue_iid = guid(
+            0x0ec870a6,
+            0x5d7e,
+            0x4c22,
+            [0x8c, 0xfc, 0x5b, 0xaa, 0xe0, 0x76, 0x16, 0xed],
+        );
+        let allocator_iid = guid(
+            0x6102dee4,
+            0xaf59,
+            0x4b09,
+            [0xb9, 0x99, 0xb4, 0x4d, 0x73, 0xf0, 0x9b, 0x24],
+        );
+        let list_iid = guid(
+            0x5b160d0f,
+            0xac1b,
+            0x4185,
+            [0x8b, 0xa8, 0xb3, 0xae, 0x42, 0xa5, 0xa4, 0x55],
+        );
+        let (mut queue, mut allocator, mut list) = (null, null, null);
+        let queue_desc = [0u32; 4];
+        assert_eq!(
+            crate::queue::create(null, queue_desc.as_ptr().cast(), &queue_iid, &mut queue),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_allocator(null, 0, &allocator_iid, &mut allocator),
+            S_OK
+        );
+        assert_eq!(
+            crate::list::create_list(null, 0, 0, allocator, null, &list_iid, &mut list),
+            S_OK
+        );
+
+        #[repr(C)]
+        struct Location {
+            resource: This,
+            kind: u32,
+            footprint: PlacedFootprint,
+        }
+        type CopyRegion =
+            extern "system" fn(This, *const Location, u32, u32, u32, *const Location, *const u8);
+        type CopyRes = extern "system" fn(This, This, This);
+        type Resolve = extern "system" fn(This, This, u32, This, u32, u32);
+        type Close = extern "system" fn(This) -> HRESULT;
+        type Reset = extern "system" fn(This, This, This) -> HRESULT;
+        type Execute = extern "system" fn(This, u32, *const This);
+
+        for fmt in PACKED_16 {
+            let rt = make_tex(fmt, 1 | 4, 1);
+            let rt2 = make_tex(fmt, 1, 1);
+            let msaa_rt = make_tex(fmt, 1, 4);
+            let sampled = make_tex(fmt, 0, 1);
+            let mut source = null;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &buffer(2048),
+                    0,
+                    null.cast(),
+                    iid,
+                    &mut source
+                ),
+                S_OK
+            );
+            let (data, _) = buffer_bytes(source).unwrap();
+            // SAFETY: the buffer holds 2048 bytes.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(data, 2048) };
+            // Non-zero buffer offset (512) with 4x4 packed 16-bit texels.
+            let texels: [u16; 16] = [
+                0x0000, 0xffff, 0x8000, 0x7c00, 0x03e0, 0x001f, 0xca73, 0x92a5, 0x1234, 0x5678,
+                0x9abc, 0xdef0, 0x8421, 0x4210, 0x0f0f, 0xf0f0,
+            ];
+            for row in 0..4 {
+                let at = 512 + row * 256;
+                for col in 0..4 {
+                    let le = texels[row * 4 + col].to_le_bytes();
+                    bytes[at + col * 2..at + col * 2 + 2].copy_from_slice(&le);
+                }
+            }
+            let src_fp = PlacedFootprint {
+                offset: 512,
+                format: fmt,
+                width: 4,
+                height: 4,
+                depth: 1,
+                row_pitch: 256,
+            };
+            let to = Location {
+                resource: rt,
+                kind: 0,
+                footprint: PlacedFootprint {
+                    offset: 0,
+                    ..src_fp
+                },
+            };
+            let from = Location {
+                resource: source,
+                kind: 1,
+                footprint: src_fp,
+            };
+            slot::<CopyRegion>(list, 0x80)(list, &to, 0, 0, 0, &from, null.cast());
+            assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+            slot::<Execute>(queue, 0x50)(queue, 1, &list);
+
+            // Read back from the host copy in its effective host format.
+            let host_image = host_resource(rt).unwrap();
+            // SAFETY: live host textures.
+            let (host_fmt, sampled_fmt) = unsafe {
+                (
+                    host_image.GetDesc().Format.0 as u32,
+                    host_resource(sampled).unwrap().GetDesc().Format.0 as u32,
+                )
+            };
+            assert_eq!(host_fmt, target_format(fmt));
+            assert_eq!(sampled_fmt, fmt);
+            assert_eq!(view_format(rt), None);
+
+            let readback_heap = D3D12_HEAP_PROPERTIES {
+                Type: D3D12_HEAP_TYPE_READBACK,
+                ..Default::default()
+            };
+            let readback_desc = D3D12_RESOURCE_DESC {
+                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+                Width: 1024,
+                Height: 1,
+                DepthOrArraySize: 1,
+                MipLevels: 1,
+                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
+                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                ..Default::default()
+            };
+            let mut readback: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation of a readback buffer.
+            unsafe {
+                host.device
+                    .CreateCommittedResource(
+                        &readback_heap,
+                        D3D12_HEAP_FLAG_NONE,
+                        &readback_desc,
+                        D3D12_RESOURCE_STATE_COPY_DEST,
+                        None,
+                        &mut readback,
+                    )
+                    .unwrap();
+            }
+            let readback = readback.unwrap();
+            let back = host.new_list().unwrap();
+            let (_, before) = host_transition(rt, 0x800).unwrap();
+            let out_to = Location {
+                resource: readback.as_raw().cast_const().cast(),
+                kind: 1,
+                footprint: PlacedFootprint {
+                    offset: 0,
+                    format: host_fmt,
+                    width: 4,
+                    height: 4,
+                    depth: 1,
+                    row_pitch: 256,
+                },
+            };
+            let out_from = Location {
+                resource: host_image.as_raw().cast_const().cast(),
+                kind: 0,
+                footprint: to.footprint,
+            };
+            // SAFETY: an open list, live resources, locations in the host layout.
+            unsafe {
+                back.list.ResourceBarrier(&[crate::host::transition(
+                    host_image,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+                back.list.CopyTextureRegion(
+                    (&raw const out_to).cast(),
+                    0,
+                    0,
+                    0,
+                    (&raw const out_from).cast(),
+                    None,
+                );
+            }
+            back.close();
+            host.execute(&[&back]);
+            let mut mapped = std::ptr::null_mut();
+            // SAFETY: the copy finished (execute waits); the buffer is 1024 bytes.
+            let read = unsafe {
+                readback
+                    .Map(
+                        0,
+                        Some(&D3D12_RANGE {
+                            Begin: 0,
+                            End: 1024,
+                        }),
+                        Some(&mut mapped),
+                    )
+                    .unwrap();
+                std::slice::from_raw_parts(mapped.cast::<u8>(), 1024)
+            };
+            for row in 0..4 {
+                let src_row = &bytes[512 + row * 256..][..8];
+                let dst_row = &read[row * 256..];
+                if host_fmt == RGBA8_UNORM {
+                    let mut expected = [0u8; 16];
+                    expand_packed16(fmt, src_row, &mut expected);
+                    assert_eq!(&dst_row[..16], &expected, "format {fmt} row {row}");
+                } else {
+                    assert_eq!(&dst_row[..8], src_row, "format {fmt} row {row}");
+                }
+            }
+
+            // Mixed transfers (native <-> widened) must be skipped cleanly and
+            // target->target resolves must succeed with the effective host format.
+            assert_eq!(slot::<Reset>(list, 0x50)(list, allocator, null), S_OK);
+            let tex_to = Location {
+                resource: rt2,
+                kind: 0,
+                footprint: PlacedFootprint {
+                    offset: 0,
+                    ..src_fp
+                },
+            };
+            let tex_from = Location {
+                resource: sampled,
+                kind: 0,
+                footprint: PlacedFootprint {
+                    offset: 0,
+                    ..src_fp
+                },
+            };
+            slot::<CopyRegion>(list, 0x80)(list, &tex_to, 0, 0, 0, &tex_from, null.cast());
+            slot::<CopyRes>(list, 0x88)(list, sampled, rt2);
+            slot::<Resolve>(list, 0x98)(list, rt2, 0, msaa_rt, 0, fmt);
+            slot::<Resolve>(list, 0x98)(list, sampled, 0, msaa_rt, 0, fmt);
+            assert_eq!(slot::<Close>(list, 0x48)(list), S_OK);
+            slot::<Execute>(queue, 0x50)(queue, 1, &list);
+            assert_eq!(slot::<Reset>(list, 0x50)(list, allocator, null), S_OK);
+            // SAFETY: a plain query.
+            assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+
+            for r in [rt, rt2, msaa_rt, sampled, source] {
+                assert_eq!(slot::<Release>(r, 0x10)(r), 0);
+            }
+        }
+        for o in [list, allocator, queue] {
+            assert_eq!(slot::<Release>(o, 0x10)(o), 0);
         }
     }
 }
