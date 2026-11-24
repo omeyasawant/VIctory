@@ -731,10 +731,8 @@ pub(super) fn plan_lds_fences(p: &Program, uniform: &[bool]) -> Result<LdsFences
         let mut changed = false;
         for &b in &order {
             if !uniform[b] {
-                let next_r =
-                    has_read[b] || p.blocks[b].preds.iter().any(|&q| pending_read[q]);
-                let next_w =
-                    has_write[b] || p.blocks[b].preds.iter().any(|&q| pending_write[q]);
+                let next_r = has_read[b] || p.blocks[b].preds.iter().any(|&q| pending_read[q]);
+                let next_w = has_write[b] || p.blocks[b].preds.iter().any(|&q| pending_write[q]);
                 if next_r && !pending_read[b] {
                     pending_read[b] = true;
                     changed = true;
@@ -4557,6 +4555,15 @@ impl<'a> Lower<'a> {
                 }
             }
             Source::Phi { block, args } => {
+                // A control-flow join does not need a heap-index phi when
+                // every incoming edge selects the same descriptor source.
+                // This also handles a constant sampler propagated through
+                // uniform branches.
+                if let Some(first) = args.first()
+                    && args.iter().all(|arg| arg == first)
+                {
+                    return self.handle(site, first, sampler, props);
+                }
                 // Each predecessor computes its heap index at its end; the
                 // join picks one with a phi.
                 let _ = site;
@@ -8369,9 +8376,7 @@ mod tests {
             S_ENDPGM,
         ];
 
-        let code: Vec<u8> = words.iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect();
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
 
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -8388,9 +8393,12 @@ mod tests {
 
         let p = ir::build(&native.code, false, 256).unwrap();
 
-        assert!(p.blocks.iter()
-            .flat_map(|b| &b.insts)
-            .any(|i| i.name() == "v_perm_b32"));
+        assert!(
+            p.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|i| i.name() == "v_perm_b32")
+        );
 
         let st = structure::structure(&p).unwrap();
         let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
@@ -8408,13 +8416,12 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
             options: super::TranslateOptions::default(),
-        }).unwrap();
+        })
+        .unwrap();
 
-        let container =
-            crate::Container::parse(&emitted.dxil).unwrap();
+        let container = crate::Container::parse(&emitted.dxil).unwrap();
 
-        let features =
-            container.part(crate::FourCC::SFI0).unwrap();
+        let features = container.part(crate::FourCC::SFI0).unwrap();
 
         u64::from_le_bytes(features.data.try_into().unwrap())
     }

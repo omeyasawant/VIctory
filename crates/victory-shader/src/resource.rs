@@ -247,12 +247,12 @@ pub fn track(
     for (block, (accesses, mut reads)) in first_lane_at {
         reads.sort_unstable();
         reads.dedup();
-        let proof = t
-            .waterfall(block, &accesses, &reads)
-            .map_err(|what| ShaderError::Unsupported {
-                offset: t.inst((block, accesses[0])).machine.offset,
-                what,
-            })?;
+        let proof =
+            t.waterfall(block, &accesses, &reads)
+                .map_err(|what| ShaderError::Unsupported {
+                    offset: t.inst((block, accesses[0])).machine.offset,
+                    what,
+                })?;
         out.waterfall.compares.extend(proof.compares);
         out.waterfall.reads.extend(proof.reads);
     }
@@ -888,8 +888,26 @@ impl<'a> Tracer<'a> {
         }
         joins.push(block);
         let phis = &self.p.blocks[block].phis;
-        let args = (0..self.p.blocks[block].preds.len())
-            .map(|j| {
+        let mut args = Vec::with_capacity(self.p.blocks[block].preds.len());
+        for (j, &pred) in self.p.blocks[block].preds.iter().enumerate() {
+            let known_len = known.len();
+            let reachable = if let Some(lanes) = self.lanes {
+                known.push((lanes.reach[pred], true));
+                if let LaneExit::Branch {
+                    when,
+                    taken,
+                    not_taken,
+                } = lanes.exits[pred]
+                    && taken != not_taken
+                    && (taken == block || not_taken == block)
+                {
+                    known.push((when, taken == block));
+                }
+                lanes.bools.meet(known)
+            } else {
+                true
+            };
+            let source = if reachable {
                 let edge: Vec<Term> = words
                     .iter()
                     .map(|w| match phi_of(w) {
@@ -897,11 +915,30 @@ impl<'a> Tracer<'a> {
                         None => *w,
                     })
                     .collect();
-                self.classify(&edge, joins, known)
-            })
-            .collect::<Result<_, _>>();
+                Some(self.classify(&edge, joins, known))
+            } else {
+                None
+            };
+            known.truncate(known_len);
+            match source {
+                Some(Ok(source)) => args.push(Some(source)),
+                Some(Err(error)) => {
+                    joins.pop();
+                    return Err(error);
+                }
+                None => args.push(None),
+            }
+        }
+        let Some(fallback) = args.iter().flatten().next().cloned() else {
+            joins.pop();
+            return Err("a descriptor with no reachable source");
+        };
+        let args = args
+            .into_iter()
+            .map(|source| source.unwrap_or_else(|| fallback.clone()))
+            .collect();
         joins.pop();
-        Ok(Some(Source::Phi { block, args: args? }))
+        Ok(Some(Source::Phi { block, args }))
     }
 
     /// Words that `s_cselect` (or `s_cmov`) picks by one SCC value, traced
@@ -1551,7 +1588,8 @@ impl<'a> Tracer<'a> {
                 } else {
                     continue;
                 };
-                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1))) else {
+                let Some(matched) = mask(inst.write(Reg::S(code)), inst.write(Reg::S(code + 1)))
+                else {
                     continue;
                 };
                 if meet(&[reach, (selected, true), (matched, false)]) {
@@ -1847,6 +1885,51 @@ pub(crate) mod tests {
                         load: (0, 3),
                         first: 0
                     }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn immediate_sampler_with_reversed_inline_word_is_constant() {
+        let r = track_words(
+            &[
+                0xBE82_0309, // s_mov_b32 s2, s9
+                0xBE89_0380, // s_mov_b32 s9, 0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0101,
+                0xFA00_0000, // s_load_dwordx8 s[4:11], s[2:3], null
+                0xB000_0092, // s_movk_i32 s0, 0x0092
+                0xBE81_03FF,
+                0x00C0_0000, // s_mov_b32 s1, 0x00c00000
+                0xBE82_0BA8, // s_brev_b32 s2, 40
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xF090_010A,
+                0x0001_0F07,
+                0x0000_1608, // image_sample_l, rsrc s[4:11], sampler s[0:3]
+                S_ENDPGM,
+            ],
+            &[param(Table, 9, 1)],
+            HwStage::Ps,
+        );
+
+        assert_eq!(
+            r.descriptors
+                .iter()
+                .map(|d| (d.role, &d.source))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    Role::Resource,
+                    &Source::Loaded {
+                        load: (0, 3),
+                        first: 0
+                    }
+                ),
+                (
+                    Role::Sampler,
+                    &Source::Constant(vec![0x92, 0x00c0_0000, 40u32.reverse_bits(), 0])
                 ),
             ]
         );
