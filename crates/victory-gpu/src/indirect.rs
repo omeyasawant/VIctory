@@ -158,6 +158,7 @@ pub(crate) fn bound(
     }
     let l = &list.list;
     let constants = [kind, stride, records, 0];
+    list.begin_command();
     list.buffer_state(buffer, BUFFER_WRITE);
     // SAFETY: an open list; our root signature, pipeline and a live buffer
     // the caller's list holds.

@@ -317,8 +317,10 @@ mod tests {
         assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
         assert_eq!(s.update(2, 'b', BUFFER_READ), None);
         assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        s.next_command();
         assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
         assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
         assert_eq!(s.update(1, 'a', BUFFER_WRITE), Some(BUFFER_READ));
         let sorted = |mut v: Vec<(char, u32)>| {
             v.sort_unstable();
@@ -330,6 +332,24 @@ mod tests {
         assert_eq!(lasts, [('a', BUFFER_WRITE), ('b', BUFFER_READ)]);
         s.clear();
         assert_eq!(s.firsts().count(), 0);
+    }
+
+    /// One command that writes a copy and reads it (#334 review): the write
+    /// state wins whichever is bound first; the next command reads again.
+    #[test]
+    fn buffer_states_keep_a_command_writing() {
+        let mut s = BufferStates::default();
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), None);
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        assert_eq!(s.update(1, 'a', BUFFER_WRITE), Some(BUFFER_READ));
+        assert_eq!(s.update(1, 'a', BUFFER_READ), None);
+        s.next_command();
+        assert_eq!(s.update(1, 'a', BUFFER_READ), Some(BUFFER_WRITE));
+        let lasts: Vec<_> = s.lasts().map(|(r, l)| (*r, l)).collect();
+        assert_eq!(lasts, [('a', BUFFER_READ)]);
     }
 
     /// Set in the child process `in_child` starts.
@@ -345,6 +365,8 @@ mod tests {
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args([&format!("host::tests::{name}"), "--exact", "--nocapture"])
             .env(CHILD, "1")
+            // The host's own message queue would empty the test's (`execute`).
+            .env_remove("VICTORY_D3D12_DEBUG")
             .output()
             .unwrap();
         let text = format!(
@@ -563,6 +585,7 @@ mod tests {
         // The draw state, with the buffer's vertices bound as `draw.rs`
         // binds them.
         let bind = |list: &HostList| {
+            list.begin_command();
             list.buffer_state(&buffer, BUFFER_READ);
             // SAFETY: an open list; our objects, alive until the lists ran.
             unsafe {
@@ -709,33 +732,54 @@ pub(crate) const BUFFER_WRITE: u32 = D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as 
 /// between; the implicit promotion from common that it relied on allows
 /// either use in a list, not both.
 ///
+/// Within one command (a draw, a dispatch, the argument clamp) the write
+/// state wins: a copy one command both writes and reads (one host copy
+/// backs most of the title's buffers) stays writable, whatever order the
+/// command's views are bound in.
+///
 /// shortcut: buffers read only through directly indexed heaps are not
 /// tracked, and a command that both writes a buffer and reads it as
-/// vertices, indices or arguments leaves it in the read state.
+/// vertices, indices or arguments reads them in the write state.
 pub(crate) struct BufferStates<R> {
-    by_copy: std::collections::HashMap<usize, (u32, u32, R)>,
+    /// First state, current state, the command that last wrote it.
+    by_copy: std::collections::HashMap<usize, (u32, u32, Option<u64>, R)>,
+    command: u64,
 }
 
 impl<R> Default for BufferStates<R> {
     fn default() -> Self {
         BufferStates {
             by_copy: std::collections::HashMap::new(),
+            command: 0,
         }
     }
 }
 
 impl<R> BufferStates<R> {
+    /// Uses from here on belong to the next command.
+    pub(crate) fn next_command(&mut self) {
+        self.command += 1;
+    }
+
     /// The list uses `copy` (`resource`) in `wanted`: the state it leaves,
     /// if a transition must be recorded now. A first use records nothing:
     /// the prelude moves the buffer there.
     pub(crate) fn update(&mut self, copy: usize, resource: R, wanted: u32) -> Option<u32> {
+        let command = self.command;
+        let wrote = (wanted == BUFFER_WRITE).then_some(command);
         match self.by_copy.entry(copy) {
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, resource));
+                v.insert((wanted, wanted, wrote, resource));
                 None
             }
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
+                let e = o.get_mut();
+                if wrote.is_some() {
+                    e.2 = wrote;
+                } else if e.2 == Some(command) {
+                    return None;
+                }
+                let before = std::mem::replace(&mut e.1, wanted);
                 (before != wanted).then_some(before)
             }
         }
@@ -743,13 +787,13 @@ impl<R> BufferStates<R> {
 
     /// The prelude's transitions: each buffer from common to its first state.
     pub(crate) fn firsts(&self) -> impl Iterator<Item = (&R, u32)> {
-        self.by_copy.values().map(|(first, _, r)| (r, *first))
+        self.by_copy.values().map(|(first, _, _, r)| (r, *first))
     }
 
     /// The list's closing transitions: each buffer from its last state back
     /// to common.
     pub(crate) fn lasts(&self) -> impl Iterator<Item = (&R, u32)> {
-        self.by_copy.values().map(|(_, last, r)| (r, *last))
+        self.by_copy.values().map(|(_, last, _, r)| (r, *last))
     }
 
     pub(crate) fn clear(&mut self) {
@@ -1377,6 +1421,12 @@ impl HostList {
                 (before != wanted).then_some((texture, before))
             }
         }
+    }
+
+    /// The uses of host copies that follow belong to a new command (draw,
+    /// dispatch): see [`BufferStates`].
+    pub(crate) fn begin_command(&self) {
+        self.buffers.lock().unwrap_or_else(|e| e.into_inner()).next_command();
     }
 
     /// Moves a host copy of title memory to `wanted` ([`BUFFER_READ`] or
